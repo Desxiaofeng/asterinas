@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{collections::BinaryHeap, sync::Arc};
+use fixed::types::extra::True;
 use core::{
     cmp::{self, Reverse},
     sync::atomic::{AtomicU64, Ordering::Relaxed},
@@ -95,15 +96,29 @@ pub const fn nice_to_weight(nice: Nice) -> u64 {
 ///         || vruntime > rq_min_vruntime + normalized_time_slice
 #[derive(Debug)]
 pub struct FairAttr {
+    // why weight is atomic?
     weight: AtomicU64,
-    vruntime: AtomicU64,
+    eligible_vruntime: AtomicU64, //同时等于每一次时间片开始的时间vruntime_start
+    vruntime_deadline: AtomicU64,
+    request_timeslice: AtomicU64,
+    timeslice: AtomicU64,    //剩余时间片
+    excuting_time: AtomicU64,     //实际执行的时间
+    lag: u64,               //暂时不知道有什么用
 }
 
 impl FairAttr {
     pub fn new(nice: Nice) -> Self {
         FairAttr {
             weight: nice_to_weight(nice).into(),
-            vruntime: Default::default(),
+            request_timeslice: Default::default(),
+
+            eligible_vruntime: Default::default(),
+            vruntime_deadline: Default::default(),
+            timeslice: Default::default(),
+            excuting_time: Default::default(),
+
+            lag: 0,
+
         }
     }
 
@@ -111,145 +126,203 @@ impl FairAttr {
         self.weight.store(nice_to_weight(nice), Relaxed);
     }
 
-    fn update_vruntime(&self, delta: u64) -> (u64, u64) {
-        let weight = self.weight.load(Relaxed);
-        let delta = delta * WEIGHT_0 / weight;
-        let vruntime = self.vruntime.fetch_add(delta, Relaxed) + delta;
-        (vruntime, weight)
+    pub fn update_request_timeslice(&self, request_timeslice: u64) {
+        self.request_timeslice.store(request_timeslice, Relaxed);
     }
 }
 
-/// The wrapper for threads in the FAIR run queue.
-///
-/// This structure is used to provide the capability for keying in the
-/// run queue implemented by `BTreeSet` in the `FairClassRq`.
-struct FairQueueItem(Arc<Task>, u64);
+struct ActiveItem {
+    task: Arc<Task>,
+    ve: u64,
+}
 
-impl core::fmt::Debug for FairQueueItem {
+impl ActiveItem {
+    fn new(task: Arc<Task>, ve: u64) -> Self{
+        ActiveItem {
+            task,
+            ve,
+        }
+    }
+
+    fn key(&self) -> u64 {
+        self.ve
+    }
+}
+
+impl core::fmt::Debug for ActiveItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{:?}", self.key())
     }
 }
 
-impl FairQueueItem {
-    fn key(&self) -> u64 {
-        self.1
-    }
-}
-
-impl PartialEq for FairQueueItem {
+impl PartialEq for ActiveItem {
     fn eq(&self, other: &Self) -> bool {
         self.key().eq(&other.key())
     }
 }
 
-impl Eq for FairQueueItem {}
+impl Eq for ActiveItem {}
 
-impl PartialOrd for FairQueueItem {
+impl PartialOrd for ActiveItem {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for FairQueueItem {
+impl Ord for ActiveItem {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         self.key().cmp(&other.key())
     }
 }
 
-/// The per-cpu run queue for the FAIR scheduling class.
-///
-/// See [`FairAttr`] for the explanation of vruntimes and scheduling periods.
-///
-/// The structure contains a `BTreeSet` to store the threads in the run queue to
-/// ensure the efficiency for finding next-to-run threads.
+struct EligibleItem {
+    task: Arc<Task>,
+    vd: u64,
+}
+
+impl EligibleItem {
+    fn new(task: Arc<Task>, vd: u64) -> Self{
+        EligibleItem {
+            task,
+            vd,
+        }
+    }
+
+    fn key(&self) -> u64 {
+        self.vd
+    }
+}
+
+impl core::fmt::Debug for EligibleItem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.key())
+    }
+}
+
+impl PartialEq for EligibleItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key().eq(&other.key())
+    }
+}
+
+impl Eq for EligibleItem {}
+
+impl PartialOrd for EligibleItem {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EligibleItem {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct FairClassRq {
     #[expect(unused)]
     cpu: CpuId,
-    /// The ready-to-run threads.
-    entities: BinaryHeap<Reverse<FairQueueItem>>,
-    /// The minimum of vruntime in the run queue. Serves as the initial
-    /// value of newly-enqueued threads.
-    min_vruntime: u64,
+    ves: BinaryHeap<Reverse<ActiveItem>>,
+    vds: BinaryHeap<Reverse<EligibleItem>>,
+    vruntime: u64,
     total_weight: u64,
 }
 
+const VRUNTIME_BASE: u64 = 1024;
 impl FairClassRq {
     pub fn new(cpu: CpuId) -> Self {
         Self {
             cpu,
-            entities: BinaryHeap::new(),
-            min_vruntime: 0,
+            ves: BinaryHeap::new(),
+            vds: BinaryHeap::new(),
+            vruntime: 0,
             total_weight: 0,
         }
-    }
-
-    /// The scheduling period is calculated as the maximum of the following two values:
-    ///
-    /// 1. The minimum period value, defined by [`min_period_clocks`].
-    /// 2. `period = min_granularity * n` where
-    ///    `min_granularity = log2(1 + num_cpus) * base_slice_clocks`, and `n` is the number of
-    ///    runnable threads (including the current running thread).
-    ///
-    /// The formula is chosen by 3 principles:
-    ///
-    /// 1. The scheduling period should reflect the running threads and CPUs;
-    /// 2. The scheduling period should not be too low to limit the overhead of context switching;
-    /// 3. The scheduling period should not be too high to ensure the scheduling latency
-    ///    & responsiveness.
-    fn period(&self) -> u64 {
-        let base_slice_clks = base_slice_clocks();
-        let min_period_clks = min_period_clocks();
-
-        // `+ 1` means including the current running thread.
-        let period_single_cpu =
-            (base_slice_clks * (self.entities.len() + 1) as u64).max(min_period_clks);
-        period_single_cpu * u64::from((1 + num_cpus()).ilog2())
-    }
-
-    /// The virtual time slice for each thread in the run queue, measured in vruntime clocks.
-    fn vtime_slice(&self) -> u64 {
-        self.period() / (self.entities.len() + 1) as u64
-    }
-
-    /// The time slice for each thread in the run queue, measured in sched clocks.
-    fn time_slice(&self, cur_weight: u64) -> u64 {
-        self.period() * cur_weight / (self.total_weight + cur_weight)
     }
 }
 
 impl SchedClassRq for FairClassRq {
+    ///入队分类讨论
+    /// 从外界入队
+    /// 1. 新生成的
+    /// 2. 睡醒之类的
+    /// 从cpu入队
+    /// 3. 时间片用完被抢占的
+    /// 4. 时间片没有完被抢占的
+    /// 
     fn enqueue(&mut self, entity: Arc<Task>, flags: Option<EnqueueFlags>) {
         let fair_attr = &entity.as_thread().unwrap().sched_attr().fair;
-        let vruntime = match flags {
-            Some(EnqueueFlags::Spawn) => self.min_vruntime + self.vtime_slice(),
-            _ => self.min_vruntime,
-        };
-        let vruntime = fair_attr
-            .vruntime
-            .fetch_max(vruntime, Relaxed)
-            .max(vruntime);
+        let weight = fair_attr.weight.load(Relaxed);
+        self.total_weight += weight;
 
-        self.total_weight += fair_attr.weight.load(Relaxed);
-        self.entities.push(Reverse(FairQueueItem(entity, vruntime)));
+        match flags {
+            Some(EnqueueFlags::Spawn) => {
+                let ve = self.vruntime;
+                let vd = ve + fair_attr.request_timeslice.load(Relaxed) / weight;
+
+                fair_attr.eligible_vruntime.store(self.vruntime, Relaxed);
+                fair_attr.vruntime_deadline.store(self.vruntime, Relaxed);
+                fair_attr.excuting_time.store(0, Relaxed);
+                fair_attr.timeslice.store(fair_attr.request_timeslice.load(Relaxed), Relaxed);
+
+                self.vds.push(Reverse(EligibleItem{
+                    task: Arc::clone(&entity), 
+                    vd: fair_attr.vruntime_deadline.load(Relaxed),
+                }));
+            }
+            // 时间片未用完被抢占/时间片用完放回队列,也就是3.4
+            _ => {
+                if fair_attr.excuting_time.load(Relaxed) < fair_attr.timeslice.load(Relaxed) {
+                    //时间片没用完，4，不需要更新数据（即申请时间片），直接加入vds
+                    
+                    self.vds.push(Reverse(EligibleItem{
+                        task: Arc::clone(&entity), 
+                        vd: fair_attr.vruntime_deadline.load(Relaxed),
+                    }));
+                } else {
+                    //时间片用完了，更新数据，重新申请
+                    let ve = fair_attr.eligible_vruntime.load(Relaxed) + fair_attr.excuting_time.load(Relaxed) / weight;
+                    let vd = ve + fair_attr.request_timeslice.load(Relaxed) / weight;
+
+                    fair_attr.eligible_vruntime.store(ve, Relaxed);
+                    fair_attr.vruntime_deadline.store(vd, Relaxed);
+                    fair_attr.excuting_time.store(0, Relaxed);
+                    fair_attr.timeslice.store(fair_attr.request_timeslice.load(Relaxed), Relaxed);
+
+                    //如果发现申请后配得则直接入vds
+                    if ve < self.vruntime {
+                        self.vds.push(Reverse(EligibleItem{
+                            task: entity,
+                            vd: vd,
+                        }));
+                    } else {
+                        self.ves.push(Reverse(ActiveItem{
+                            task: entity, 
+                            ve: ve,
+                        }));
+                    }
+                }
+            }
+        }
     }
 
     fn len(&self) -> usize {
-        self.entities.len()
+        self.ves.len() + self.vds.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.entities.is_empty()
+        self.ves.is_empty() && self.vds.is_empty()
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
-        let Reverse(FairQueueItem(entity, _)) = self.entities.pop()?;
+        let Reverse(EligibleItem{task, vd}) = self.vds.pop()?;
 
-        let sched_attr = entity.as_thread().unwrap().sched_attr();
+        let sched_attr = task.as_thread().unwrap().sched_attr();
+        // why minus weight here?
         self.total_weight -= sched_attr.fair.weight.load(Relaxed);
 
-        Some(entity)
+        Some(task)
     }
 
     fn update_current(
@@ -261,14 +334,38 @@ impl SchedClassRq for FairClassRq {
         match flags {
             UpdateFlags::Yield => true,
             UpdateFlags::Tick | UpdateFlags::Wait => {
-                let (vruntime, weight) = attr.fair.update_vruntime(rt.delta);
-                self.min_vruntime = match self.entities.peek() {
-                    Some(Reverse(leftmost)) => vruntime.min(leftmost.key()),
-                    None => vruntime,
-                };
-
-                rt.period_delta > self.time_slice(weight)
-                    || vruntime > self.min_vruntime + self.vtime_slice()
+                //更新虚拟时间流动
+                self.vruntime += rt.delta / self.total_weight;
+                //更新实际执行时间，为了下一步查看时间片是否用完
+                attr.fair.excuting_time.fetch_add(rt.delta, Relaxed);
+                //查看时间片是否用完，用完则切换
+                if attr.fair.excuting_time.load(Relaxed) >= attr.fair.timeslice.load(Relaxed) {
+                    return true;
+                } else {
+                    //TODO: 看看有没有deadline更小的
+                    //每次尝试从ves中拿一个已经eligible的插入vds
+                    if let Some(Reverse(ActiveItem{task, ve})) = self.ves.peek() {
+                        if *ve <= self.vruntime {
+                            if let Some(Reverse(ActiveItem{task, ve})) = self.ves.pop() {
+                                self.vds.push(Reverse(EligibleItem{
+                                    task: Arc::clone(&task),
+                                    vd: task.as_thread().unwrap().sched_attr().fair.vruntime_deadline.load(Relaxed),
+                                }));
+                            }
+                        }
+                    }
+                    //尝试从vds中拿一个出来，如果vd更小则抢占
+                    match self.vds.peek() {
+                        Some(Reverse(EligibleItem{task, vd})) => {
+                            if *vd < attr.fair.vruntime_deadline.load(Relaxed) {
+                                true
+                            }else {
+                                false
+                            }
+                        }
+                        None => false
+                    }
+                }
             }
         }
     }
