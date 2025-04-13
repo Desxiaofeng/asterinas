@@ -240,7 +240,24 @@ impl FairClassRq {
             total_weight: 0,
         }
     }
+
+    fn period(&self) -> u64 {
+        let base_slice_clks = base_slice_clocks();
+        let min_period_clks = min_period_clocks();
+
+        // `+ 1` means including the current running thread.
+        let period_single_cpu =
+            (base_slice_clks * (self.ves.len() + self.vds.len() + 1) as u64).max(min_period_clks);
+        period_single_cpu * u64::from((1 + num_cpus()).ilog2())
+    }
+
+    /// The time slice for each thread in the run queue, measured in sched clocks.
+    fn time_slice(&self, cur_weight: u64) -> u64 {
+        self.period() * cur_weight / (self.total_weight + cur_weight)
+    }
 }
+use crate::println;
+use crate::print;
 
 impl SchedClassRq for FairClassRq {
     ///入队分类讨论
@@ -255,6 +272,7 @@ impl SchedClassRq for FairClassRq {
         let fair_attr = &entity.as_thread().unwrap().sched_attr().fair;
         let weight = fair_attr.weight.load(Relaxed);
         self.total_weight += weight;
+        fair_attr.request_timeslice.store(self.time_slice(weight), Relaxed);
 
         match flags {
             Some(EnqueueFlags::Spawn) => {
@@ -275,7 +293,6 @@ impl SchedClassRq for FairClassRq {
             _ => {
                 if fair_attr.excuting_time.load(Relaxed) < fair_attr.timeslice.load(Relaxed) {
                     //时间片没用完，4，不需要更新数据（即申请时间片），直接加入vds
-                    
                     self.vds.push(Reverse(EligibleItem{
                         task: Arc::clone(&entity), 
                         vd: fair_attr.vruntime_deadline.load(Relaxed),
@@ -291,7 +308,7 @@ impl SchedClassRq for FairClassRq {
                     fair_attr.timeslice.store(fair_attr.request_timeslice.load(Relaxed), Relaxed);
 
                     //如果发现申请后配得则直接入vds
-                    if ve < self.vruntime {
+                    if ve <= self.vruntime {
                         self.vds.push(Reverse(EligibleItem{
                             task: entity,
                             vd: vd,
@@ -317,11 +334,9 @@ impl SchedClassRq for FairClassRq {
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
         let Reverse(EligibleItem{task, vd}) = self.vds.pop()?;
-
         let sched_attr = task.as_thread().unwrap().sched_attr();
         // why minus weight here?
         self.total_weight -= sched_attr.fair.weight.load(Relaxed);
-
         Some(task)
     }
 
@@ -335,7 +350,7 @@ impl SchedClassRq for FairClassRq {
             UpdateFlags::Yield => true,
             UpdateFlags::Tick | UpdateFlags::Wait => {
                 //更新虚拟时间流动
-                self.vruntime += rt.delta / self.total_weight;
+                self.vruntime += rt.delta / (self.total_weight + attr.fair.weight.load(Relaxed));
                 //更新实际执行时间，为了下一步查看时间片是否用完
                 attr.fair.excuting_time.fetch_add(rt.delta, Relaxed);
                 //查看时间片是否用完，用完则切换
@@ -363,7 +378,9 @@ impl SchedClassRq for FairClassRq {
                                 false
                             }
                         }
-                        None => false
+                        None => {
+                            false
+                        }
                     }
                 }
             }
