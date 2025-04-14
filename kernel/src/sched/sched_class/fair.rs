@@ -255,6 +255,44 @@ impl FairClassRq {
     fn time_slice(&self, cur_weight: u64) -> u64 {
         self.period() * cur_weight / (self.total_weight + cur_weight)
     }
+
+    fn request(&self, fair_attr: &FairAttr, flags: Option<EnqueueFlags>) -> (u64, u64){
+        let (ve, vd, timeslice) = match flags {
+            Some(EnqueueFlags::Spawn) => {
+                let timeslice = fair_attr.request_timeslice.load(Relaxed);
+
+                (self.vruntime, self.vruntime + timeslice / fair_attr.weight.load(Relaxed), timeslice)
+            },
+            _ => {
+                let timeslice = fair_attr.request_timeslice.load(Relaxed);
+                let ve = fair_attr.eligible_vruntime.load(Relaxed) 
+                    + fair_attr.excuting_time.load(Relaxed) 
+                    / fair_attr.weight.load(Relaxed);
+                let vd = ve + timeslice / fair_attr.weight.load(Relaxed);
+                
+                (ve, vd, timeslice)
+            }
+        };
+
+        fair_attr.eligible_vruntime.store(ve, Relaxed);
+        fair_attr.vruntime_deadline.store(vd, Relaxed);
+        fair_attr.excuting_time.store(0, Relaxed);
+        fair_attr.timeslice.store(timeslice, Relaxed);
+        (ve, vd)
+    }
+
+    fn update_ves(&self) {
+        if let Some(Reverse(ActiveItem{task, ve})) = self.ves.peek() {
+            if *ve <= self.vruntime {
+                if let Some(Reverse(ActiveItem{task, ve})) = self.ves.pop() {
+                    self.vds.push(Reverse(EligibleItem{
+                        task: Arc::clone(&task),
+                        vd: task.as_thread().unwrap().sched_attr().fair.vruntime_deadline.load(Relaxed),
+                    }));
+                }
+            }
+        }
+    }
 }
 use crate::println;
 use crate::print;
@@ -272,17 +310,11 @@ impl SchedClassRq for FairClassRq {
         let fair_attr = &entity.as_thread().unwrap().sched_attr().fair;
         let weight = fair_attr.weight.load(Relaxed);
         self.total_weight += weight;
-        fair_attr.request_timeslice.store(self.time_slice(weight), Relaxed);
+        fair_attr.update_request_timeslice(self.time_slice(weight));
 
         match flags {
             Some(EnqueueFlags::Spawn) => {
-                let ve = self.vruntime;
-                let vd = ve + fair_attr.request_timeslice.load(Relaxed) / weight;
-
-                fair_attr.eligible_vruntime.store(self.vruntime, Relaxed);
-                fair_attr.vruntime_deadline.store(self.vruntime, Relaxed);
-                fair_attr.excuting_time.store(0, Relaxed);
-                fair_attr.timeslice.store(fair_attr.request_timeslice.load(Relaxed), Relaxed);
+                let (ve, vd) = self.request(fair_attr, flags);
 
                 self.vds.push(Reverse(EligibleItem{
                     task: Arc::clone(&entity), 
@@ -294,19 +326,12 @@ impl SchedClassRq for FairClassRq {
                 if fair_attr.excuting_time.load(Relaxed) < fair_attr.timeslice.load(Relaxed) {
                     //时间片没用完，4，不需要更新数据（即申请时间片），直接加入vds
                     self.vds.push(Reverse(EligibleItem{
-                        task: Arc::clone(&entity), 
+                        task: entity, 
                         vd: fair_attr.vruntime_deadline.load(Relaxed),
                     }));
                 } else {
                     //时间片用完了，更新数据，重新申请
-                    let ve = fair_attr.eligible_vruntime.load(Relaxed) + fair_attr.excuting_time.load(Relaxed) / weight;
-                    let vd = ve + fair_attr.request_timeslice.load(Relaxed) / weight;
-
-                    fair_attr.eligible_vruntime.store(ve, Relaxed);
-                    fair_attr.vruntime_deadline.store(vd, Relaxed);
-                    fair_attr.excuting_time.store(0, Relaxed);
-                    fair_attr.timeslice.store(fair_attr.request_timeslice.load(Relaxed), Relaxed);
-
+                    let (ve, vd) = self.request(fair_attr, flags);
                     //如果发现申请后配得则直接入vds
                     if ve <= self.vruntime {
                         self.vds.push(Reverse(EligibleItem{
@@ -333,6 +358,7 @@ impl SchedClassRq for FairClassRq {
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
+        self.update_ves();
         let Reverse(EligibleItem{task, vd}) = self.vds.pop()?;
         let sched_attr = task.as_thread().unwrap().sched_attr();
         // why minus weight here?
@@ -348,27 +374,24 @@ impl SchedClassRq for FairClassRq {
     ) -> bool {
         match flags {
             UpdateFlags::Yield => true,
-            UpdateFlags::Tick | UpdateFlags::Wait => {
-                //更新虚拟时间流动
-                self.vruntime += rt.delta / (self.total_weight + attr.fair.weight.load(Relaxed));
+            UpdateFlags::Tick => {
                 //更新实际执行时间，为了下一步查看时间片是否用完
                 attr.fair.excuting_time.fetch_add(rt.delta, Relaxed);
+                //更新虚拟时间流动
+                self.vruntime += rt.delta / (self.total_weight + attr.fair.weight.load(Relaxed));
+
                 //查看时间片是否用完，用完则切换
                 if attr.fair.excuting_time.load(Relaxed) >= attr.fair.timeslice.load(Relaxed) {
-                    return true;
-                } else {
-                    //TODO: 看看有没有deadline更小的
-                    //每次尝试从ves中拿一个已经eligible的插入vds
-                    if let Some(Reverse(ActiveItem{task, ve})) = self.ves.peek() {
-                        if *ve <= self.vruntime {
-                            if let Some(Reverse(ActiveItem{task, ve})) = self.ves.pop() {
-                                self.vds.push(Reverse(EligibleItem{
-                                    task: Arc::clone(&task),
-                                    vd: task.as_thread().unwrap().sched_attr().fair.vruntime_deadline.load(Relaxed),
-                                }));
-                            }
-                        }
+                    //只剩下当前一个任务，不要切换，重新分配时间片即可
+                    if self.is_empty() {
+                        self.request(&attr.fair, None);
+                        return false;
+                    } else {
+                        return true;
                     }
+                } else {
+                    //每次尝试从ves中拿一个已经eligible的插入vds
+                    self.update_ves();
                     //尝试从vds中拿一个出来，如果vd更小则抢占
                     match self.vds.peek() {
                         Some(Reverse(EligibleItem{task, vd})) => {
@@ -383,6 +406,10 @@ impl SchedClassRq for FairClassRq {
                         }
                     }
                 }
+            }
+            //睡眠前走这里
+            UpdateFlags::Wait => {
+                true
             }
         }
     }
