@@ -107,6 +107,11 @@ trait SchedClassRq: Send + fmt::Debug {
     /// Enqueues a task into the run queue.
     fn enqueue(&mut self, task: Arc<Task>, flags: Option<EnqueueFlags>);
 
+    /// Dequeue a task from run queue, which is self.current now
+    fn dequeue(&mut self, task: Arc<Task>, rt: CurrentRuntime) -> bool {
+        true
+    }
+
     /// Returns the number of threads in the run queue.
     fn len(&self) -> usize;
 
@@ -362,7 +367,11 @@ impl LocalRunQueue for PerCpuClassRqSet {
     }
 
     fn dequeue_current(&mut self) -> Option<Arc<Task>> {
-        self.current.take().map(|((cur_task, _), _)| {
+        self.current.take().map(|((cur_task, cur_thread), mut rt)| {
+            if let SchedPolicyKind::Fair = cur_thread.sched_attr().policy_kind() {
+                self.fair.dequeue(Arc::clone(&cur_task), rt);
+            }
+            
             cur_task.schedule_info().cpu.set_to_none();
             cur_task
         })

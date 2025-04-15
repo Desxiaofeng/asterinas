@@ -3,8 +3,7 @@
 use alloc::{collections::BinaryHeap, sync::Arc};
 use fixed::types::extra::True;
 use core::{
-    cmp::{self, Reverse},
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
+    cmp::{self, Reverse}, sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed}
 };
 
 use ostd::{
@@ -103,7 +102,7 @@ pub struct FairAttr {
     request_timeslice: AtomicU64,
     timeslice: AtomicU64,    //剩余时间片
     excuting_time: AtomicU64,     //实际执行的时间
-    lag: u64,               //暂时不知道有什么用
+    lag: AtomicI64,               //暂时不知道有什么用
 }
 
 impl FairAttr {
@@ -117,7 +116,7 @@ impl FairAttr {
             timeslice: Default::default(),
             excuting_time: Default::default(),
 
-            lag: 0,
+            lag: Default::default(),
 
         }
     }
@@ -251,37 +250,37 @@ impl FairClassRq {
         period_single_cpu * u64::from((1 + num_cpus()).ilog2())
     }
 
-    /// The time slice for each thread in the run queue, measured in sched clocks.
+    //先统一时间片吧
     fn time_slice(&self, cur_weight: u64) -> u64 {
-        self.period() * cur_weight / (self.total_weight + cur_weight)
+        // self.period() * cur_weight / (self.total_weight + cur_weight)
+        self.period() / (1 + self.len() as u64)
     }
 
     fn request(&self, fair_attr: &FairAttr, flags: Option<EnqueueFlags>) -> (u64, u64){
-        let (ve, vd, timeslice) = match flags {
+        let (ve, vd, timeslice, ex) = match flags {
             Some(EnqueueFlags::Spawn) => {
                 let timeslice = fair_attr.request_timeslice.load(Relaxed);
 
-                (self.vruntime, self.vruntime + timeslice / fair_attr.weight.load(Relaxed), timeslice)
+                (self.vruntime, self.vruntime + timeslice / fair_attr.weight.load(Relaxed), timeslice, 0 as u64)
             },
             _ => {
                 let timeslice = fair_attr.request_timeslice.load(Relaxed);
-                let ve = fair_attr.eligible_vruntime.load(Relaxed) 
-                    + fair_attr.excuting_time.load(Relaxed) 
-                    / fair_attr.weight.load(Relaxed);
+                let ve = fair_attr.vruntime_deadline.load(Relaxed);
                 let vd = ve + timeslice / fair_attr.weight.load(Relaxed);
+                let ex = fair_attr.excuting_time.load(Relaxed) - fair_attr.timeslice.load(Relaxed);
                 
-                (ve, vd, timeslice)
+                (ve, vd, timeslice, ex)
             }
         };
 
+        fair_attr.timeslice.store(timeslice, Relaxed);
         fair_attr.eligible_vruntime.store(ve, Relaxed);
         fair_attr.vruntime_deadline.store(vd, Relaxed);
-        fair_attr.excuting_time.store(0, Relaxed);
-        fair_attr.timeslice.store(timeslice, Relaxed);
+        fair_attr.excuting_time.store(ex, Relaxed);
         (ve, vd)
     }
 
-    fn update_ves(&self) {
+    fn update_ves(&mut self, is_ve: bool) {
         if let Some(Reverse(ActiveItem{task, ve})) = self.ves.peek() {
             if *ve <= self.vruntime {
                 if let Some(Reverse(ActiveItem{task, ve})) = self.ves.pop() {
@@ -291,6 +290,9 @@ impl FairClassRq {
                     }));
                 }
             }
+        }
+        if !is_ve && self.vds.is_empty() {
+            // panic!("wrong happen");
         }
     }
 }
@@ -303,17 +305,20 @@ impl SchedClassRq for FairClassRq {
     /// 1. 新生成的
     /// 2. 睡醒之类的
     /// 从cpu入队
-    /// 3. 时间片用完被抢占的
+    /// 3. 不配得
     /// 4. 时间片没有完被抢占的
     /// 
-    fn enqueue(&mut self, entity: Arc<Task>, flags: Option<EnqueueFlags>) {
+    /// 
+    fn enqueue(&mut self, entity: Arc<Task>, flags: Option<EnqueueFlags>) { //当运行中的任务重新入队，flags为None
         let fair_attr = &entity.as_thread().unwrap().sched_attr().fair;
         let weight = fair_attr.weight.load(Relaxed);
-        self.total_weight += weight;
-        fair_attr.update_request_timeslice(self.time_slice(weight));
+        self.update_ves(true);
 
         match flags {
             Some(EnqueueFlags::Spawn) => {
+                fair_attr.update_request_timeslice(self.time_slice(weight));
+                self.total_weight += weight;
+
                 let (ve, vd) = self.request(fair_attr, flags);
 
                 self.vds.push(Reverse(EligibleItem{
@@ -321,32 +326,82 @@ impl SchedClassRq for FairClassRq {
                     vd: fair_attr.vruntime_deadline.load(Relaxed),
                 }));
             }
-            // 时间片未用完被抢占/时间片用完放回队列,也就是3.4
-            _ => {
-                if fair_attr.excuting_time.load(Relaxed) < fair_attr.timeslice.load(Relaxed) {
-                    //时间片没用完，4，不需要更新数据（即申请时间片），直接加入vds
+            //睡醒了
+            Some(EnqueueFlags::Wake) => {
+                self.total_weight += weight;
+                let lag = fair_attr.lag.load(Relaxed);
+
+                if self.is_empty() || lag >= 0 {
+                    let (ve, vd) = self.request(fair_attr, Some(EnqueueFlags::Spawn));
                     self.vds.push(Reverse(EligibleItem{
-                        task: entity, 
+                        task: Arc::clone(&entity), 
                         vd: fair_attr.vruntime_deadline.load(Relaxed),
                     }));
                 } else {
-                    //时间片用完了，更新数据，重新申请
-                    let (ve, vd) = self.request(fair_attr, flags);
-                    //如果发现申请后配得则直接入vds
-                    if ve <= self.vruntime {
-                        self.vds.push(Reverse(EligibleItem{
-                            task: entity,
-                            vd: vd,
-                        }));
-                    } else {
-                        self.ves.push(Reverse(ActiveItem{
-                            task: entity, 
-                            ve: ve,
-                        }));
-                    }
+                    // 伪装过去申请时间片
+                    fair_attr.eligible_vruntime.store(self.vruntime, Relaxed);
+                    fair_attr.vruntime_deadline.store(
+                        self.vruntime + fair_attr.timeslice.load(Relaxed) / weight, 
+                        Relaxed);
+                    fair_attr.excuting_time.store((-lag) as u64, Relaxed);
+
+                    self.vruntime = (self.vruntime as i64 - (lag / (self.total_weight) as i64) as i64) as u64;
+                    
+                    // let (ve, vd) = self.request(fair_attr, Some(EnqueueFlags::Wake));
+                    
+
+                    self.vds.push(Reverse(EligibleItem{
+                        task: Arc::clone(&entity), 
+                        vd: fair_attr.vruntime_deadline.load(Relaxed),
+                    }));
+                }
+            }
+            // 时间片未用完被抢占/不配得放回队列,也就是3.4
+            None => {
+                let ve = fair_attr.eligible_vruntime.load(Relaxed);
+                let vd = fair_attr.vruntime_deadline.load(Relaxed);
+                if ve <= self.vruntime {
+                    self.vds.push(Reverse(EligibleItem{
+                        task: entity,
+                        vd: vd,
+                    }));
+                } else {
+                    self.ves.push(Reverse(ActiveItem{
+                        task: entity, 
+                        ve: ve,
+                    }));
                 }
             }
         }
+    }
+
+    //目前还不能睡眠，因为持有锁
+    //TODO: 释放锁让出时间片直到配得，注意part_current()的race condition
+    //具体做法，配得时，先判断is_wake，如果醒了则不用dequeue了
+    //注意is_wake和dequeue必须是wake()异步的临界区。
+    fn dequeue(&mut self, task: Arc<Task>, mut rt: CurrentRuntime) -> bool {
+        let fair_attr = &task.as_thread().unwrap().sched_attr().fair;
+        rt.update();
+        fair_attr.excuting_time.fetch_add(rt.delta, Relaxed);
+        self.vruntime += rt.delta / self.total_weight;
+
+        self.update_ves(fair_attr.eligible_vruntime.load(Relaxed) <= self.vruntime);
+
+        println!("{}, {}", self.vruntime, fair_attr.eligible_vruntime.load(Relaxed));
+        let lag = ((self.vruntime - fair_attr.eligible_vruntime.load(Relaxed)) //可以执行，意味着这里一定是正数
+            * fair_attr.weight.load(Relaxed)
+            / self.total_weight) as i64
+            - fair_attr.excuting_time.load(Relaxed) as i64;
+        
+        fair_attr.lag.store(lag, Relaxed);
+        //用lag更新vruntime
+        self.total_weight -= fair_attr.weight.load(Relaxed);
+        if self.total_weight == 0 {
+            return true;
+        }
+        self.vruntime = (self.vruntime as i64 + (lag / self.total_weight as i64) as i64) as u64;
+
+        true
     }
 
     fn len(&self) -> usize {
@@ -358,11 +413,8 @@ impl SchedClassRq for FairClassRq {
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
-        self.update_ves();
+        self.update_ves(true);
         let Reverse(EligibleItem{task, vd}) = self.vds.pop()?;
-        let sched_attr = task.as_thread().unwrap().sched_attr();
-        // why minus weight here?
-        self.total_weight -= sched_attr.fair.weight.load(Relaxed);
         Some(task)
     }
 
@@ -372,40 +424,40 @@ impl SchedClassRq for FairClassRq {
         attr: &SchedAttr,
         flags: UpdateFlags,
     ) -> bool {
+        // match flags {
+        //     UpdateFlags::Yield => println!("1"),
+        //     UpdateFlags::Tick => println!("2"),
+        //     UpdateFlags::Wait => println!("3"),
+        // }
+        //更新实际执行时间，为了下一步查看时间片是否用完
+        attr.fair.excuting_time.fetch_add(rt.delta, Relaxed);
+        //更新虚拟时间流动
+        self.vruntime += rt.delta / self.total_weight;
+        // println!("{},{}", self.vruntime, attr.fair.eligible_vruntime.load(Relaxed));
+        self.update_ves(attr.fair.eligible_vruntime.load(Relaxed) <= self.vruntime);
         match flags {
-            UpdateFlags::Yield => true,
+            UpdateFlags::Yield => {
+                true
+            },
             UpdateFlags::Tick => {
-                //更新实际执行时间，为了下一步查看时间片是否用完
-                attr.fair.excuting_time.fetch_add(rt.delta, Relaxed);
-                //更新虚拟时间流动
-                self.vruntime += rt.delta / (self.total_weight + attr.fair.weight.load(Relaxed));
-
-                //查看时间片是否用完，用完则切换
+                //查看时间片是否用完，用完则请求
                 if attr.fair.excuting_time.load(Relaxed) >= attr.fair.timeslice.load(Relaxed) {
-                    //只剩下当前一个任务，不要切换，重新分配时间片即可
-                    if self.is_empty() {
-                        self.request(&attr.fair, None);
-                        return false;
-                    } else {
+                    self.request(&attr.fair, None);
+                }
+                // if attr.fair.excuting_time.load(Relaxed) < base_slice_clocks() {
+                //     return false;
+                // }
+                //尝试从vds中拿一个出来，如果vd更小则抢占
+                if let Some(Reverse(EligibleItem{task, vd})) = self.vds.peek() {
+                    if *vd < attr.fair.vruntime_deadline.load(Relaxed) 
+                    || true {
                         return true;
                     }
-                } else {
-                    //每次尝试从ves中拿一个已经eligible的插入vds
-                    self.update_ves();
-                    //尝试从vds中拿一个出来，如果vd更小则抢占
-                    match self.vds.peek() {
-                        Some(Reverse(EligibleItem{task, vd})) => {
-                            if *vd < attr.fair.vruntime_deadline.load(Relaxed) {
-                                true
-                            }else {
-                                false
-                            }
-                        }
-                        None => {
-                            false
-                        }
-                    }
                 }
+                if attr.fair.eligible_vruntime.load(Relaxed) > self.vruntime {
+                    return true;
+                }
+                false
             }
             //睡眠前走这里
             UpdateFlags::Wait => {
