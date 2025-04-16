@@ -26,7 +26,7 @@ use crate::{
 const WEIGHT_0: u64 = 1024;
 pub const fn nice_to_weight(nice: Nice) -> u64 {
     // return 1;
-    
+
     // Calculated by the formula below:
     //
     //     weight = 1024 * 1.25^(-nice)
@@ -197,7 +197,7 @@ impl FairClassRq {
         Self {
             cpu,
             ves: BinaryHeap::new(),
-            vruntime: 0,
+            vruntime: 1<<10,
             total_weight: 0,
         }
     }
@@ -287,45 +287,36 @@ impl SchedClassRq for FairClassRq {
             }
             //睡醒了
             Some(EnqueueFlags::Wake) => {
-                // self.total_weight += weight;
-                // let lag = fair_attr.lag.load(Relaxed);
-
-                // if self.is_empty() || lag >= 0 {
-                //     let (ve, vd) = self.request(fair_attr, Some(EnqueueFlags::Spawn));
-                //     self.ves.push(Reverse(ActiveItem{
-                //         task: Arc::clone(&entity), 
-                //         ve: ve,
-                //         vd: vd,
-                //     }));
-                // } else {
-                //     // 伪装过去申请时间片
-                //     fair_attr.eligible_vruntime.store(self.vruntime, Relaxed);
-                //     fair_attr.vruntime_deadline.store(
-                //         self.vruntime + fair_attr.timeslice.load(Relaxed) / weight, 
-                //         Relaxed);
-                //     fair_attr.excuting_time.store((-lag) as u64, Relaxed);
-
-                //     self.vruntime = (self.vruntime as i64 - (lag / (self.total_weight) as i64) as i64) as u64;
-                    
-                //     // let (ve, vd) = self.request(fair_attr, Some(EnqueueFlags::Wake));
-                    
-
-                //     self.ves.push(Reverse(ActiveItem{
-                //         task: Arc::clone(&entity), 
-                //         ve: fair_attr.eligible_vruntime.load(Relaxed),
-                //         vd: fair_attr.vruntime_deadline.load(Relaxed),
-                //     }));
-                // }
-                fair_attr.update_request_timeslice(self.time_slice(weight));
                 self.total_weight += weight;
+                let lag = fair_attr.lag.load(Relaxed);
 
-                let (ve, vd) = self.request(fair_attr, Some(EnqueueFlags::Spawn));
+                if self.is_empty() || lag >= 0 {
+                    let (ve, vd) = self.request(fair_attr, Some(EnqueueFlags::Spawn));
+                    self.ves.push(Reverse(ActiveItem{
+                        task: Arc::clone(&entity), 
+                        ve: ve,
+                        vd: vd,
+                    }));
+                } else {
+                    // 伪装过去申请时间片
+                    fair_attr.eligible_vruntime.store(self.vruntime, Relaxed);
+                    fair_attr.vruntime_deadline.store(
+                        self.vruntime + fair_attr.timeslice.load(Relaxed) / weight, 
+                        Relaxed);
+                    fair_attr.start_time.store(self.vruntime , Relaxed);
+                    fair_attr.excuting_time.store((-lag)as u64 , Relaxed);
+                    fair_attr.total_ex_time.store((-lag)as u64, Relaxed);
 
-                self.ves.push(Reverse(ActiveItem{
-                    task: Arc::clone(&entity), 
-                    ve: ve,
-                    vd: vd,
-                }));
+                    //误差来源
+                    self.vruntime = (self.vruntime as i64 - (lag / (self.total_weight) as i64) as i64) as u64;
+                    
+
+                    self.ves.push(Reverse(ActiveItem{
+                        task: Arc::clone(&entity), 
+                        ve: fair_attr.eligible_vruntime.load(Relaxed),
+                        vd: fair_attr.vruntime_deadline.load(Relaxed),
+                    }));
+                }
             }
             // 时间片未用完被抢占/不配得放回队列,也就是3.4
             None => {
@@ -363,22 +354,22 @@ impl SchedClassRq for FairClassRq {
         fair_attr.lag.store(lag, SeqCst);
         self.total_weight -= fair_attr.weight.load(SeqCst);
 
-        let mut total_lag = 0 as i64;
+        // let mut total_lag = 0 as i64;
 
-        for Reverse(ActiveItem{task, ve, vd}) in &self.ves {
-            total_lag += 
-            ((self.vruntime) as i64 - (task.as_thread().unwrap().sched_attr().fair.start_time.load(SeqCst)) as i64)
-            * (task.as_thread().unwrap().sched_attr().fair.weight.load(SeqCst)) as i64
-            - task.as_thread().unwrap().sched_attr().fair.total_ex_time.load(SeqCst) as i64
-        }
-        total_lag += lag;
-        println!("{}, {}", total_lag, self.len());
+        // for Reverse(ActiveItem{task, ve, vd}) in &self.ves {
+        //     total_lag += 
+        //     ((self.vruntime) as i64 - (task.as_thread().unwrap().sched_attr().fair.start_time.load(SeqCst)) as i64)
+        //     * (task.as_thread().unwrap().sched_attr().fair.weight.load(SeqCst)) as i64
+        //     - task.as_thread().unwrap().sched_attr().fair.total_ex_time.load(SeqCst) as i64
+        // }
+        // total_lag += lag;
+        // println!("{}, {}, {}", lag, total_lag, self.len());
 
         if self.total_weight == 0 {
-            // self.vruntime = 0;
             return true;
         } else {
-            self.vruntime = (self.vruntime as i64 + (lag / self.total_weight as i64) as i64) as u64;
+            //误差来源
+            self.vruntime = (self.vruntime as i64 + ((lag + (self.total_weight*73/100)as i64)/ self.total_weight as i64) as i64) as u64;
 
             return true
         }
@@ -394,16 +385,10 @@ impl SchedClassRq for FairClassRq {
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
-        // if let Some(Reverse(ActiveItem{task, ve, vd})) = self.ves.peek() {
-        //     if *ve > self.vruntime {
-        //         return None;
-        //     }
-        // }
         let Reverse(ActiveItem{task, ve, vd}) = self.ves.pop()?;
-        if ve > self.vruntime && self.len() == 0{
+        if ve > self.vruntime{
             
             // println!("wrong! {}, {}", ve - self.vruntime, self.len());
-            // self.vruntime = ve;
         }
         Some(task)
     }
@@ -416,7 +401,7 @@ impl SchedClassRq for FairClassRq {
     ) -> bool {
         let weight = attr.fair.weight.load(SeqCst);
         let vruntime_delta = rt.delta / self.total_weight;
-        let realtime_delta = vruntime_delta * weight;
+        let realtime_delta = vruntime_delta * self.total_weight;
         self.vruntime += vruntime_delta;
         attr.fair.excuting_time.fetch_add(realtime_delta, SeqCst);
         attr.fair.total_ex_time.fetch_add(realtime_delta, SeqCst);
