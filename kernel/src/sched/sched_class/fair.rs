@@ -20,8 +20,11 @@ use super::{
 };
 use crate::{
     sched::nice::{Nice, NiceValue},
-    thread::AsThread,
+    thread::{task, AsThread},
 };
+
+use super::augment_tree::AugmentTree;
+use super::augment_tree::AugmentTreeNode;
 
 const WEIGHT_0: u64 = 1024;
 pub const fn nice_to_weight(nice: Nice) -> u64 {
@@ -136,57 +139,12 @@ impl FairAttr {
     }
 }
 
-struct ActiveItem {
-    task: Arc<Task>,
-    ve: u64,
-    vd: u64,
-}
-
-impl ActiveItem {
-    fn new(task: Arc<Task>, ve: u64, vd: u64) -> Self{
-        ActiveItem {
-            task,
-            ve,
-            vd,
-        }
-    }
-
-    fn key(&self) -> u64 {
-        self.ve
-    }
-}
-
-impl core::fmt::Debug for ActiveItem {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:?}", self.key())
-    }
-}
-
-impl PartialEq for ActiveItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.key().eq(&other.key())
-    }
-}
-
-impl Eq for ActiveItem {}
-
-impl PartialOrd for ActiveItem {
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ActiveItem {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.key().cmp(&other.key())
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct FairClassRq {
     #[expect(unused)]
     cpu: CpuId,
-    ves: BinaryHeap<Reverse<ActiveItem>>,
+    pub tree: AugmentTree,
+    tree_len: u64,
     vruntime: u64,
     total_weight: u64,
 }
@@ -196,7 +154,8 @@ impl FairClassRq {
     pub fn new(cpu: CpuId) -> Self {
         Self {
             cpu,
-            ves: BinaryHeap::new(),
+            tree: AugmentTree::new(),
+            tree_len: 0,
             vruntime: 1<<10,
             total_weight: 0,
         }
@@ -208,14 +167,14 @@ impl FairClassRq {
 
         // `+ 1` means including the current running thread.
         let period_single_cpu =
-            (base_slice_clks * (self.ves.len() + 1) as u64).max(min_period_clks);
+            (base_slice_clks * (self.tree_len + 1) as u64).max(min_period_clks);
         period_single_cpu * u64::from((1 + num_cpus()).ilog2())
     }
 
     //先统一时间片吧
     fn time_slice(&self, cur_weight: u64) -> u64 {
         // self.period() * cur_weight / (self.total_weight + cur_weight)
-        self.period() / (1 + self.len() as u64)
+        self.period() / (1 + self.tree_len as u64)
     }
 
     fn request(&self, fair_attr: &FairAttr, flags: Option<EnqueueFlags>) -> (u64, u64){
@@ -279,11 +238,10 @@ impl SchedClassRq for FairClassRq {
 
                 let (ve, vd) = self.request(fair_attr, flags);
 
-                self.ves.push(Reverse(ActiveItem{
-                    task: Arc::clone(&entity), 
-                    ve: ve,
-                    vd: vd,
-                }));
+                let res = self.tree.insert(AugmentTreeNode::new(ve, vd, entity));
+                if res {
+                    self.tree_len += 1;
+                }
             }
             //睡醒了
             Some(EnqueueFlags::Wake) => {
@@ -292,11 +250,11 @@ impl SchedClassRq for FairClassRq {
 
                 if self.is_empty() || lag >= 0 {
                     let (ve, vd) = self.request(fair_attr, Some(EnqueueFlags::Spawn));
-                    self.ves.push(Reverse(ActiveItem{
-                        task: Arc::clone(&entity), 
-                        ve: ve,
-                        vd: vd,
-                    }));
+
+                    let res = self.tree.insert(AugmentTreeNode::new(ve, vd, entity));
+                    if res {
+                        self.tree_len += 1;
+                    }
                 } else {
                     // 伪装过去申请时间片
                     fair_attr.eligible_vruntime.store(self.vruntime, Relaxed);
@@ -311,11 +269,10 @@ impl SchedClassRq for FairClassRq {
                     self.vruntime = (self.vruntime as i64 - (lag / (self.total_weight) as i64) as i64) as u64;
                     
 
-                    self.ves.push(Reverse(ActiveItem{
-                        task: Arc::clone(&entity), 
-                        ve: fair_attr.eligible_vruntime.load(Relaxed),
-                        vd: fair_attr.vruntime_deadline.load(Relaxed),
-                    }));
+                    let res = self.tree.insert(AugmentTreeNode::new(fair_attr.eligible_vruntime.load(Relaxed), fair_attr.vruntime_deadline.load(Relaxed), entity));
+                    if res {
+                        self.tree_len += 1;
+                    }
                 }
             }
             // 时间片未用完被抢占/不配得放回队列,也就是3.4
@@ -323,11 +280,10 @@ impl SchedClassRq for FairClassRq {
                 let ve = fair_attr.eligible_vruntime.load(Relaxed);
                 let vd = fair_attr.vruntime_deadline.load(Relaxed);
                 
-                self.ves.push(Reverse(ActiveItem{
-                    task: entity, 
-                    ve: ve,
-                    vd: vd,
-                }));
+                let res = self.tree.insert(AugmentTreeNode::new(ve, vd, entity));
+                if res {
+                    self.tree_len += 1;
+                }
             }
         }
     }
@@ -338,12 +294,6 @@ impl SchedClassRq for FairClassRq {
     //注意is_wake和dequeue必须是wake()异步的临界区。
     fn dequeue(&mut self, task: Arc<Task>, mut rt: CurrentRuntime) -> bool {
         let fair_attr = &task.as_thread().unwrap().sched_attr().fair;
-        // rt.update();
-        // fair_attr.excuting_time.fetch_add(rt.delta, Relaxed);
-        // self.vruntime += rt.delta / self.total_weight;
-        // if fair_attr.eligible_vruntime.load(SeqCst) > self.vruntime{
-        //     println!("{}, {}", fair_attr.eligible_vruntime.load(Relaxed)-self.vruntime, self.len());
-        // }
     
         let start: i64 = fair_attr.start_time.load(SeqCst) as i64;
         let end: i64 = self.vruntime as i64;
@@ -353,17 +303,6 @@ impl SchedClassRq for FairClassRq {
         
         fair_attr.lag.store(lag, SeqCst);
         self.total_weight -= fair_attr.weight.load(SeqCst);
-
-        // let mut total_lag = 0 as i64;
-
-        // for Reverse(ActiveItem{task, ve, vd}) in &self.ves {
-        //     total_lag += 
-        //     ((self.vruntime) as i64 - (task.as_thread().unwrap().sched_attr().fair.start_time.load(SeqCst)) as i64)
-        //     * (task.as_thread().unwrap().sched_attr().fair.weight.load(SeqCst)) as i64
-        //     - task.as_thread().unwrap().sched_attr().fair.total_ex_time.load(SeqCst) as i64
-        // }
-        // total_lag += lag;
-        // println!("{}, {}, {}", lag, total_lag, self.len());
 
         if self.total_weight == 0 {
             return true;
@@ -377,20 +316,24 @@ impl SchedClassRq for FairClassRq {
     }
 
     fn len(&self) -> usize {
-        self.ves.len()
+        self.tree_len as usize
     }
 
     fn is_empty(&self) -> bool {
-        self.ves.is_empty()
+        self.tree_len == 0
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
-        let Reverse(ActiveItem{task, ve, vd}) = self.ves.pop()?;
-        if ve > self.vruntime{
+        let node = self.tree.pick(self.vruntime)?;
+        self.tree.delete(node.clone());
+        self.tree_len -= 1;
+
+
+        if node.borrow().eligible_vruntime > self.vruntime{
             
             // println!("wrong! {}, {}", ve - self.vruntime, self.len());
         }
-        Some(task)
+        Some(node.borrow().task.clone())
     }
 
     fn update_current(
@@ -421,8 +364,8 @@ impl SchedClassRq for FairClassRq {
                 //     return false;
                 // }
                 //尝试从vds中拿一个出来，如果vd更小则抢占
-                if let Some(Reverse(ActiveItem{task, ve, vd})) = self.ves.peek() {
-                    if *vd < attr.fair.vruntime_deadline.load(Relaxed) 
+                if let Some(node) = self.tree.pick(self.vruntime) {
+                    if node.borrow().vruntime_deadline < attr.fair.vruntime_deadline.load(Relaxed) 
                     || true {
                         return true;
                     }

@@ -32,6 +32,7 @@ mod fair;
 mod idle;
 mod real_time;
 mod stop;
+mod augment_tree;
 
 use self::policy::{SchedPolicyKind, SchedPolicyState};
 pub use self::{
