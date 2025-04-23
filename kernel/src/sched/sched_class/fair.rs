@@ -3,7 +3,7 @@
 use alloc::{collections::BinaryHeap, sync::Arc};
 use fixed::types::extra::True;
 use core::{
-    cmp::{self, Reverse}, sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed}
+    cmp::{self, Reverse}, sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed}, u64::MAX
 };
 use core::sync::atomic::Ordering::SeqCst;
 use ostd::{
@@ -143,11 +143,12 @@ impl FairAttr {
 pub(super) struct FairClassRq {
     #[expect(unused)]
     cpu: CpuId,
-    pub tree: AugmentTree,
-    tree_len: u64,
+    tree: AugmentTree,
     vruntime: u64,
     total_weight: u64,
 }
+// unsafe impl Send for FairClassRq {}
+// unsafe impl Sync for FairClassRq {}
 
 const VRUNTIME_BASE: u64 = 1024;
 impl FairClassRq {
@@ -155,7 +156,6 @@ impl FairClassRq {
         Self {
             cpu,
             tree: AugmentTree::new(),
-            tree_len: 0,
             vruntime: 1<<10,
             total_weight: 0,
         }
@@ -167,14 +167,14 @@ impl FairClassRq {
 
         // `+ 1` means including the current running thread.
         let period_single_cpu =
-            (base_slice_clks * (self.tree_len + 1) as u64).max(min_period_clks);
+            (base_slice_clks * (self.tree.len + 1) as u64).max(min_period_clks);
         period_single_cpu * u64::from((1 + num_cpus()).ilog2())
     }
 
     //先统一时间片吧
     fn time_slice(&self, cur_weight: u64) -> u64 {
         // self.period() * cur_weight / (self.total_weight + cur_weight)
-        self.period() / (1 + self.tree_len as u64)
+        self.period() / (1 + self.tree.len as u64)
     }
 
     fn request(&self, fair_attr: &FairAttr, flags: Option<EnqueueFlags>) -> (u64, u64){
@@ -236,11 +236,15 @@ impl SchedClassRq for FairClassRq {
                 fair_attr.update_request_timeslice(self.time_slice(weight));
                 self.total_weight += weight;
 
-                let (ve, vd) = self.request(fair_attr, flags);
+                let (ve, mut vd) = self.request(fair_attr, flags);
 
-                let res = self.tree.insert(AugmentTreeNode::new(ve, vd, entity));
-                if res {
-                    self.tree_len += 1;
+                loop {
+                    let res = self.tree.insert(ve, vd, entity.clone());
+                    if res {
+                        break;
+                    }
+                    println!("try1");
+                    vd += 1;
                 }
             }
             //睡醒了
@@ -249,11 +253,15 @@ impl SchedClassRq for FairClassRq {
                 let lag = fair_attr.lag.load(Relaxed);
 
                 if self.is_empty() || lag >= 0 {
-                    let (ve, vd) = self.request(fair_attr, Some(EnqueueFlags::Spawn));
+                    let (ve, mut vd) = self.request(fair_attr, Some(EnqueueFlags::Spawn));
 
-                    let res = self.tree.insert(AugmentTreeNode::new(ve, vd, entity));
-                    if res {
-                        self.tree_len += 1;
+                    loop {
+                        let res = self.tree.insert(ve, vd, entity.clone());
+                        if res {
+                            break;
+                        }
+                        println!("try2");
+                        vd += 1;
                     }
                 } else {
                     // 伪装过去申请时间片
@@ -268,21 +276,30 @@ impl SchedClassRq for FairClassRq {
                     //误差来源
                     self.vruntime = (self.vruntime as i64 - (lag / (self.total_weight) as i64) as i64) as u64;
                     
+                    let (ve, mut vd) = (fair_attr.eligible_vruntime.load(Relaxed), fair_attr.vruntime_deadline.load(Relaxed));
 
-                    let res = self.tree.insert(AugmentTreeNode::new(fair_attr.eligible_vruntime.load(Relaxed), fair_attr.vruntime_deadline.load(Relaxed), entity));
-                    if res {
-                        self.tree_len += 1;
+                    loop {
+                        let res = self.tree.insert(ve, vd, entity.clone());
+                        if res {
+                            break;
+                        }
+                        println!("try3");
+                        vd += 1;
                     }
                 }
             }
             // 时间片未用完被抢占/不配得放回队列,也就是3.4
             None => {
                 let ve = fair_attr.eligible_vruntime.load(Relaxed);
-                let vd = fair_attr.vruntime_deadline.load(Relaxed);
+                let mut vd = fair_attr.vruntime_deadline.load(Relaxed);
                 
-                let res = self.tree.insert(AugmentTreeNode::new(ve, vd, entity));
-                if res {
-                    self.tree_len += 1;
+                loop {
+                    let res = self.tree.insert(ve, vd, entity.clone());
+                    if res {
+                        break;
+                    }
+                    println!("try4");
+                    vd += 1;
                 }
             }
         }
@@ -316,24 +333,23 @@ impl SchedClassRq for FairClassRq {
     }
 
     fn len(&self) -> usize {
-        self.tree_len as usize
+        self.tree.len as usize
     }
 
     fn is_empty(&self) -> bool {
-        self.tree_len == 0
+        self.tree.len == 0
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
-        let node = self.tree.pick(self.vruntime)?;
-        self.tree.delete(node.clone());
-        self.tree_len -= 1;
+        let node = self.tree.pick(MAX)?;
+        self.tree.delete(node.clone(), None);
 
-
-        if node.borrow().eligible_vruntime > self.vruntime{
+        // if node.borrow().eligible_vruntime > self.vruntime{
             
-            // println!("wrong! {}, {}", ve - self.vruntime, self.len());
-        }
-        Some(node.borrow().task.clone())
+        //     // println!("wrong! {}, {}", ve - self.vruntime, self.len());
+        // }
+        let x = Some(node.lock().task.clone());
+        x
     }
 
     fn update_current(
@@ -365,7 +381,7 @@ impl SchedClassRq for FairClassRq {
                 // }
                 //尝试从vds中拿一个出来，如果vd更小则抢占
                 if let Some(node) = self.tree.pick(self.vruntime) {
-                    if node.borrow().vruntime_deadline < attr.fair.vruntime_deadline.load(Relaxed) 
+                    if node.lock().vruntime_deadline < attr.fair.vruntime_deadline.load(Relaxed) 
                     || true {
                         return true;
                     }

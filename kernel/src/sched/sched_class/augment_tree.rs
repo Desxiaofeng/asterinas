@@ -1,6 +1,5 @@
-use alloc::rc::{Rc, Weak};
-use core::cell::RefCell;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use aster_logger::print;
 use ostd::{
     cpu::{num_cpus, CpuId},
     task::{
@@ -8,223 +7,253 @@ use ostd::{
         Task,
     },
 };
-use core::cmp::min;
-
+use spin::Mutex;
 #[derive(Debug)]
-pub(super) struct AugmentTree {
-    pub root: Option<Rc<RefCell<AugmentTreeNode>>>,
+pub struct AugmentTree {
+    pub root: Option<Arc<Mutex<AugmentTreeNode>>>,
+    pub len: u64,
 }
 impl AugmentTree {
     pub fn new() -> Self {
         AugmentTree {
             root: None,
+            len: 0,
         }
     }
 
-    pub fn up_update(&self, node: Rc<RefCell<AugmentTreeNode>>) -> bool {
-        let mut parent = Rc::clone(&node);
-        let mut current = Rc::clone(&node);
+    fn up_update(&self, node: Arc<Mutex<AugmentTreeNode>>, end: Option<Arc<Mutex<AugmentTreeNode>>>) -> bool {
+        let mut current = node;
         loop {
-            let mut min_ve = u64::MAX;
-            if let Some(left) = current.borrow().left_child.as_ref() {
-                min_ve = min(min_ve, left.borrow().min_eligible_vruntime);
-            }
-            if let Some(right) = current.borrow().right_child.as_ref() {
-                min_ve = min(min_ve, right.borrow().min_eligible_vruntime);
-            }
-            min_ve = min(min_ve, current.borrow().eligible_vruntime);
-            {
-                current.borrow_mut().min_eligible_vruntime = min_ve;
-            }
-            match current.borrow().parent.as_ref() {
+            let mut guard = current.lock();
+            let mut min_ve = guard.eligible_vruntime;
+            min_ve = min_ve.min(guard
+                .left_child.as_ref()
+                .map(|tmp| tmp.lock().min_eligible_vruntime)
+                .unwrap_or(u64::MAX)
+            );
+            min_ve = min_ve.min(guard
+                .right_child.as_ref()
+                .map(|tmp| tmp.lock().min_eligible_vruntime)
+                .unwrap_or(u64::MAX)
+            );
+            guard.min_eligible_vruntime = min_ve;
+
+            match guard.parent.as_ref() {
                 Some(parent_node) => {
-                    parent = parent_node.upgrade().unwrap();
+                    let parent = parent_node.upgrade().unwrap();
+                    drop(guard);
+                    if end.is_some() && Arc::ptr_eq(&parent, end.as_ref().unwrap()) {
+                        return true;
+                    }
+                    current = parent;
                 }
                 None => {
                     return true;
                 }
             }
-            current = Rc::clone(&parent);
         }
     }
 
-    pub fn insert(&mut self, mut insert_node: AugmentTreeNode) -> bool {
-        match &self.root {
-            Some(root) => {
-                let mut current_node = Rc::clone(root); 
-                let mut next_node = Rc::clone(root);
-
-                loop {
-                    if insert_node.vruntime_deadline < current_node.borrow().vruntime_deadline {
-                        if let Some(child) = &current_node.borrow().left_child {
-                            next_node = Rc::clone(child);
-                        } else {
-                            insert_node.parent = Some(Rc::downgrade(&current_node));
-                            current_node.borrow_mut().left_child = Some(Rc::new(RefCell::new(insert_node)));
-                            self.up_update(current_node.clone());
-                            return true;
-                        }
-                    } else if insert_node.vruntime_deadline > current_node.borrow().vruntime_deadline {
-                        if let Some(child) = &current_node.borrow().right_child {
-                            next_node = Rc::clone(child);
-                        } else {
-                            insert_node.parent = Some(Rc::downgrade(&current_node));
-                            current_node.borrow_mut().right_child = Some(Rc::new(RefCell::new(insert_node)));
-                            self.up_update(current_node.clone());
-                            return true;
-                        }
-                    } else {
-                        return false;
-                    };
-                    current_node = next_node;
+    fn _find(&self, vd: u64) -> Option<Arc<Mutex<AugmentTreeNode>>> {
+        let mut current = self.root.as_ref().unwrap().clone();
+        
+        loop {
+            let current_guard = current.lock();
+            if vd < current_guard.vruntime_deadline {
+                if current_guard.left_child.is_some() {
+                    let child = current_guard.left_child.as_ref().unwrap().clone();
+                    drop(current_guard);
+                    current = child;
+                } else {
+                    drop(current_guard);
+                    return Some(current);
                 }
-            }
-            None => {
-                self.root = Some(Rc::new(RefCell::new(insert_node)));
-            }
-        }
-        true
-    }
-
-    pub fn delete(&mut self, delete_node: Rc<RefCell<AugmentTreeNode>>) -> bool {
-        if delete_node.borrow().left_child.is_none() || delete_node.borrow().right_child.is_none() {
-            if delete_node.borrow().left_child.is_none() && delete_node.borrow().right_child.is_none() {
-                if delete_node.borrow().parent.is_none() {
-                    self.root = None;
-                    return true;
-                }else {
-                    let parent = delete_node.borrow().parent.as_ref().unwrap().upgrade().unwrap().clone();
-                    if parent.borrow().left_child.is_some() && Rc::ptr_eq(&delete_node, &parent.borrow().left_child.as_ref().unwrap()) {
-                        parent.borrow_mut().left_child = None;
-                        self.up_update(parent);
-                        return true;
-                    } else {
-                        parent.borrow_mut().right_child = None;
-                        self.up_update(parent);
-                        return true;
-                    }
+            } else if vd >= current_guard.vruntime_deadline {
+                if current_guard.right_child.is_some() {
+                    let child = current_guard.right_child.as_ref().unwrap().clone();
+                    drop(current_guard);
+                    current = child;
+                } else {
+                    drop(current_guard);
+                    return Some(current);
                 }
             } else {
-                if delete_node.borrow().left_child.is_some() {
-                    if delete_node.borrow().parent.is_none() {
-                        let node = delete_node.borrow().left_child.as_ref().unwrap().clone();
-                        node.borrow_mut().parent = None;
-                        self.root = Some(node);
-                        
-                        return true;
-                    }else {
-                        let parent = delete_node.borrow().parent.as_ref().unwrap().upgrade().unwrap().clone();
-                        if parent.borrow().left_child.is_some() && Rc::ptr_eq(&delete_node, &parent.borrow().left_child.as_ref().unwrap()) {
-                            parent.borrow_mut().left_child = Some(delete_node.borrow().left_child.as_ref().unwrap().clone());
-                            delete_node.borrow().left_child.as_ref().unwrap().borrow_mut().parent = Some(Rc::downgrade(&parent));
-                            self.up_update(parent);
-                            return true;
-                        } else {
-                            parent.borrow_mut().right_child = Some(delete_node.borrow().left_child.as_ref().unwrap().clone());
-                            delete_node.borrow().left_child.as_ref().unwrap().borrow_mut().parent = Some(Rc::downgrade(&parent));
-                            self.up_update(parent);
-                            return true;
-                        }
+                return None;
+            }
+        }
+    }
+
+    pub fn insert(&mut self, ev: u64, vd: u64, task: Arc<Task>) -> bool {
+        if self.root.is_some() {
+            let to_be_inserted = self._find(vd);
+            match to_be_inserted {
+                Some(node) => {
+                    let mut guard = node.lock();
+                    if vd < guard.vruntime_deadline {
+                        guard.left_child = Some(Arc::new(Mutex::new(AugmentTreeNode::new_with_parent(ev, vd, task, Arc::downgrade(&node)))));
+
+                    } else {
+                        guard.right_child = Some(Arc::new(Mutex::new(AugmentTreeNode::new_with_parent(ev, vd, task, Arc::downgrade(&node)))));
                     }
-                } else {
-                    if delete_node.borrow().parent.is_none() {
-                        delete_node.borrow().right_child.as_ref().unwrap().borrow_mut().parent = None;
-                        self.root = Some(delete_node.borrow().right_child.as_ref().unwrap().clone());
-                        return true;
-                    }else {
-                        let parent = delete_node.borrow().parent.as_ref().unwrap().upgrade().unwrap().clone();
-                        if parent.borrow().left_child.is_some() && Rc::ptr_eq(&delete_node, &parent.borrow().left_child.as_ref().unwrap()) {
-                            parent.borrow_mut().left_child = Some(delete_node.borrow().right_child.as_ref().unwrap().clone());
-                            delete_node.borrow().right_child.as_ref().unwrap().borrow_mut().parent = Some(Rc::downgrade(&parent));
-                            self.up_update(parent);
-                            return true;
-                        } else {
-                            parent.borrow_mut().right_child = Some(delete_node.borrow().right_child.as_ref().unwrap().clone());
-                            delete_node.borrow().right_child.as_ref().unwrap().borrow_mut().parent = Some(Rc::downgrade(&parent));
-                            self.up_update(parent);
-                            return true;
-                        }
-                    }
+                    drop(guard);
+                    self.up_update(node, None);
+                }
+                // this mean there is a node with same vd
+                None => {
+                    return false;
                 }
             }
         } else {
-            let t = delete_node.borrow().right_child.as_ref().unwrap().clone();
-            let sussesor = self.find_succesor(t);
-            sussesor.borrow_mut().left_child = Some(delete_node.borrow().left_child.as_ref().unwrap().clone());
-            delete_node.borrow().left_child.as_ref().unwrap().borrow_mut().parent = Some(Rc::downgrade(&sussesor));
-            sussesor.borrow_mut().right_child = Some(delete_node.borrow().right_child.as_ref().unwrap().clone());
-            delete_node.borrow().right_child.as_ref().unwrap().borrow_mut().parent = Some(Rc::downgrade(&sussesor));
-            if delete_node.borrow().parent.is_none() {
-                self.root = Some(sussesor.clone());
-            }
-            sussesor.borrow_mut().parent = delete_node.borrow().parent.clone();
-            self.up_update(sussesor.clone());
+            self.root = Some(Arc::new(Mutex::new(AugmentTreeNode::new(ev, vd, task))));
         }
+        self.len += 1;
+        return true;
+    }
+
+    pub fn pick(&self, ev: u64) -> Option<Arc<Mutex<AugmentTreeNode>>> {
+        if self.len == 0 {
+            return None;
+        }
+
+        let mut current = self.root.as_ref().unwrap().clone();
+
+        loop {
+            let guard = current.lock();
+            if let Some(node) = guard.left_child.as_ref() {
+                if node.lock().min_eligible_vruntime <= ev{
+                    let next = node.clone();
+                    drop(guard);
+                    current = next;
+                    continue;
+                }
+            }
+
+            // current or right
+            if guard.eligible_vruntime <= ev {
+                drop(guard);
+                return Some(current);
+            } else {
+                if let Some(node) = guard.right_child.as_ref() {
+                    let next = node.clone();
+                    drop(guard);
+                    current = next;
+                    continue;
+                } else {
+                    return None;
+                }
+            }
+        };
+    }
+
+    pub fn delete(&mut self, delete_node: Arc<Mutex<AugmentTreeNode>>, end: Option<Arc<Mutex<AugmentTreeNode>>>) -> bool {
+        let mut guard = delete_node.lock();
+        let have_left = guard.left_child.is_some();
+        let have_right = guard.right_child.is_some();
+        let have_parent = guard.parent.is_some();
+        let (is_left, parent) = if have_parent {
+            let parent = guard.parent.take().unwrap().upgrade(); 
+            let is_left = guard.vruntime_deadline < parent.as_ref().unwrap().lock().vruntime_deadline;
+            (is_left, parent)
+        } else {
+            (false, None)
+        };
+        // drop(guard);
+
+        match (have_left, have_right) {
+            (false, false) => {
+                if have_parent {
+                    if is_left {
+                        parent.as_ref().unwrap().lock().left_child = None;
+                    } else {
+                        parent.as_ref().unwrap().lock().right_child = None;
+                    }
+                    self.up_update(parent.unwrap(), end);
+                } else {
+                    self.root = None;
+                }
+            }
+            (true, false) => {
+                if have_parent {
+                    guard.left_child.as_ref().unwrap().lock().parent = Some(Arc::downgrade(parent.as_ref().unwrap()));
+                    if is_left {
+                        parent.as_ref().unwrap().lock().left_child = guard.left_child.take();
+                    } else {
+                        parent.as_ref().unwrap().lock().right_child = guard.left_child.take();
+                    }
+                    self.up_update(parent.unwrap(), end);
+                } else {
+                    guard.left_child.as_ref().unwrap().lock().parent = None;
+                    self.root = guard.left_child.take();
+                }
+            }
+            (false, true) => {
+                if have_parent {
+                    guard.right_child.as_ref().unwrap().lock().parent = Some(Arc::downgrade(parent.as_ref().unwrap()));
+                    if is_left {
+                        parent.as_ref().unwrap().lock().left_child = guard.right_child.take();
+                    } else {
+                        parent.as_ref().unwrap().lock().right_child = guard.right_child.take();
+                    }
+                    self.up_update(parent.unwrap(), end);
+                } else {
+                    guard.right_child.as_ref().unwrap().lock().parent = None;
+                    self.root = guard.right_child.take();
+                }
+
+            }
+            (true, true) => {
+                drop(guard);
+                let succesor = self.find_succesor(delete_node.clone());
+                let mut guard = delete_node.lock();
+                let mut succesor_guard = succesor.lock();
+                guard.left_child.as_ref().unwrap().lock().parent = Some(Arc::downgrade(&succesor));
+                guard.right_child.as_ref().unwrap().lock().parent = Some(Arc::downgrade(&succesor));
+                succesor_guard.left_child = guard.left_child.take();
+                succesor_guard.right_child = guard.right_child.take();
+                
+
+                if have_parent {
+                    succesor_guard.parent = Some(Arc::downgrade(parent.as_ref().unwrap()));
+                    
+                    if is_left {
+                        parent.as_ref().unwrap().lock().left_child = Some(succesor.clone());
+                    } else {
+                        parent.as_ref().unwrap().lock().right_child = Some(succesor.clone());
+                    }
+                } else {
+                    self.root = Some(succesor.clone());
+                }
+                drop(guard);
+                drop(succesor_guard);
+                self.up_update(succesor, end);
+                self.len += 1;
+            }
+        }
+        self.len -= 1;
         true
     }
 
-    fn find_succesor(&mut self, delete_node: Rc<RefCell<AugmentTreeNode>>) -> Rc<RefCell<AugmentTreeNode>> {
-        let mut current = delete_node.clone();
-        let mut next = delete_node.clone();
+    fn find_succesor(&mut self, delete_node: Arc<Mutex<AugmentTreeNode>>) -> Arc<Mutex<AugmentTreeNode>> {
+        let mut current = delete_node.lock().right_child.as_ref().unwrap().clone();
+        
         loop {
-            match current.borrow().left_child.as_ref() {
+            let guard = current.lock();
+            match guard.left_child.as_ref() {
                 Some(node) => {
-                    next = node.clone();
+                    let next = node.clone();
+                    drop(guard);
+                    current = next;
+                    continue;
                 }
                 None => {
+                    drop(guard);
                     break;
                 }
             }
-            current = next;
         }
-        self.delete(current.clone());
-        return current.clone();
-    }
+        self.delete(current.clone(), Some(delete_node));
 
-    pub fn pick(&self, ve: u64) -> Option<Rc<RefCell<AugmentTreeNode>>> {
-        let result;
-        let mut current = match &self.root {
-            Some(node) => {
-                Rc::clone(node)
-            }
-            None => {
-                return None;
-            }
-        };
-        let mut next_node = Rc::clone(&current);
-
-        loop {
-            let goto_left = if let Some(node) = &current.borrow().left_child {
-                if node.borrow().min_eligible_vruntime <= ve {
-                    next_node = Rc::clone(node);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            
-            if goto_left == false {
-                if current.borrow().eligible_vruntime <= ve {
-                    result = Some(Rc::clone(&current));
-                    break;
-                }else {
-                    if let Some(node) = &current.borrow().right_child {
-                        next_node = Rc::clone(node);
-                    } else {
-                        return None;
-                    }
-                }
-            }
-            current = Rc::clone(&next_node);
-        };
-
-        return result;
-    }
-
-    fn clear(&mut self) {
-        self.root = None;
+        return current;
     }
 }
 
@@ -235,9 +264,9 @@ pub struct AugmentTreeNode {
     pub min_eligible_vruntime: u64,
     pub task: Arc<Task>,
 
-    pub parent: Option<Weak<RefCell<AugmentTreeNode>>>,
-    pub left_child: Option<Rc<RefCell<AugmentTreeNode>>>,
-    pub right_child: Option<Rc<RefCell<AugmentTreeNode>>>,
+    pub parent: Option<Weak<Mutex<AugmentTreeNode>>>,
+    pub left_child: Option<Arc<Mutex<AugmentTreeNode>>>,
+    pub right_child: Option<Arc<Mutex<AugmentTreeNode>>>,
 }
 impl AugmentTreeNode {
     pub fn new(eligible_vruntime: u64, vruntime_deadline: u64, task: Arc<Task>) -> Self {
@@ -246,7 +275,20 @@ impl AugmentTreeNode {
             vruntime_deadline,
             min_eligible_vruntime: eligible_vruntime,
             task: task,
+
             parent: None,
+            left_child: None,
+            right_child: None,
+        }
+    }
+    pub fn new_with_parent(eligible_vruntime: u64, vruntime_deadline: u64, task: Arc<Task>, parent: Weak<Mutex<AugmentTreeNode>>) -> Self {
+        AugmentTreeNode {
+            eligible_vruntime,
+            vruntime_deadline,
+            min_eligible_vruntime: eligible_vruntime,
+            task: task,
+
+            parent: Some(parent),
             left_child: None,
             right_child: None,
         }
