@@ -341,7 +341,7 @@ impl SchedClassRq for FairClassRq {
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
-        let node = self.tree.pick(MAX)?;
+        let node = self.tree.pick(self.vruntime)?;
         self.tree.delete(node.clone(), None);
 
         // if node.borrow().eligible_vruntime > self.vruntime{

@@ -207,7 +207,9 @@ impl AugmentTree {
                 let mut guard = delete_node.lock();
                 let mut succesor_guard = succesor.lock();
                 guard.left_child.as_ref().unwrap().lock().parent = Some(Arc::downgrade(&succesor));
-                guard.right_child.as_ref().unwrap().lock().parent = Some(Arc::downgrade(&succesor));
+                if guard.right_child.is_some() {
+                    guard.right_child.as_ref().unwrap().lock().parent = Some(Arc::downgrade(&succesor));
+                }
                 succesor_guard.left_child = guard.left_child.take();
                 succesor_guard.right_child = guard.right_child.take();
                 
