@@ -157,7 +157,6 @@ impl AugmentTree {
         } else {
             (false, None)
         };
-        // drop(guard);
 
         match (have_left, have_right) {
             (false, false) => {

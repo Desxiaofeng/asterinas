@@ -5,7 +5,7 @@ use fixed::types::extra::True;
 use core::{
     cmp::{self, Reverse}, sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed}, u64::MAX
 };
-use core::sync::atomic::Ordering::SeqCst;
+// use core::sync::atomic::Ordering::Relaxed;
 use ostd::{
     cpu::{num_cpus, CpuId},
     task::{
@@ -102,12 +102,13 @@ pub const fn nice_to_weight(nice: Nice) -> u64 {
 pub struct FairAttr {
     // why weight is atomic?
     weight: AtomicU64,
+    vruntime: AtomicU64,
     eligible_vruntime: AtomicU64, //同时等于每一次时间片开始的时间vruntime_start
     vruntime_deadline: AtomicU64,
     request_timeslice: AtomicU64,
     timeslice: AtomicU64,    //剩余时间片
     start_time: AtomicU64,
-    excuting_time: AtomicU64,     //实际执行的时间
+    excuting_time: AtomicU64,     //单次实际执行的时间
     total_ex_time: AtomicU64,
     lag: AtomicI64,               //暂时不知道有什么用
 }
@@ -118,9 +119,11 @@ impl FairAttr {
             weight: nice_to_weight(nice).into(),
             request_timeslice: Default::default(),
 
+            vruntime: AtomicU64::new(2<<10),
             eligible_vruntime: Default::default(),
             vruntime_deadline: Default::default(),
             timeslice: Default::default(),
+
             start_time: Default::default(),
             excuting_time: Default::default(),
             total_ex_time: Default::default(),
@@ -144,11 +147,11 @@ pub(super) struct FairClassRq {
     #[expect(unused)]
     cpu: CpuId,
     tree: AugmentTree,
-    vruntime: u64,
+    current: Option<Arc<Task>>,
+    min_vruntime: u64,
+    total_vruntime: u64,
     total_weight: u64,
 }
-// unsafe impl Send for FairClassRq {}
-// unsafe impl Sync for FairClassRq {}
 
 const VRUNTIME_BASE: u64 = 1024;
 impl FairClassRq {
@@ -156,7 +159,9 @@ impl FairClassRq {
         Self {
             cpu,
             tree: AugmentTree::new(),
-            vruntime: 1<<10,
+            current: None,
+            min_vruntime: 0,
+            total_vruntime: 0,
             total_weight: 0,
         }
     }
@@ -177,40 +182,29 @@ impl FairClassRq {
         self.period() / (1 + self.tree.len as u64)
     }
 
+    // 计算ve, vd, timeslice
     fn request(&self, fair_attr: &FairAttr, flags: Option<EnqueueFlags>) -> (u64, u64){
         let (ve, vd, timeslice) = match flags {
             Some(EnqueueFlags::Spawn) => {
-                let timeslice = fair_attr.request_timeslice.load(SeqCst);
-                fair_attr.start_time.store(self.vruntime, SeqCst);
-                fair_attr.total_ex_time.store(0, SeqCst);
-
-                (self.vruntime, self.vruntime + timeslice / fair_attr.weight.load(SeqCst), timeslice)
+                let timeslice = fair_attr.request_timeslice.load(Relaxed);
+                let vruntime = fair_attr.vruntime.load(Relaxed);
+                let weight = fair_attr.weight.load(Relaxed);
+                (vruntime, vruntime + timeslice / weight, timeslice)
             },
             _ => {
-                let timeslice = fair_attr.request_timeslice.load(SeqCst);
-                let ve = fair_attr.eligible_vruntime.load(SeqCst) 
-                    + fair_attr.excuting_time.load(SeqCst)/ fair_attr.weight.load(SeqCst);
-                let vd = ve + timeslice / fair_attr.weight.load(SeqCst);
-
-                (ve, vd, timeslice)
+                let timeslice = fair_attr.request_timeslice.load(Relaxed);
+                let vruntime = fair_attr.vruntime.load(Relaxed);
+                let weight = fair_attr.weight.load(Relaxed);
+                (vruntime, vruntime + timeslice / weight, timeslice)
             }
         };
 
-        fair_attr.timeslice.store(timeslice, SeqCst);
-        fair_attr.eligible_vruntime.store(ve, SeqCst);
-        fair_attr.vruntime_deadline.store(vd, SeqCst);
-        fair_attr.excuting_time.store(0, SeqCst);
+        fair_attr.timeslice.store(timeslice, Relaxed);
+        fair_attr.eligible_vruntime.store(ve, Relaxed);
+        fair_attr.vruntime_deadline.store(vd, Relaxed);
+        fair_attr.excuting_time.store(0, Relaxed);
 
         (ve, vd)
-    }
-
-    fn update_ves(&mut self, attr: &FairAttr) {
-        let delta = attr.eligible_vruntime.load(Relaxed) as i64 
-        - self.vruntime as i64;
-        if delta > 0 && self.is_empty(){
-            println!("hanpen with {}", delta);
-            // self.vruntime = attr.eligible_vruntime.load(Relaxed);
-        }
     }
 }
 use crate::println;
@@ -228,79 +222,79 @@ impl SchedClassRq for FairClassRq {
     /// 
     fn enqueue(&mut self, entity: Arc<Task>, flags: Option<EnqueueFlags>) { //当运行中的任务重新入队，flags为None
         let fair_attr = &entity.as_thread().unwrap().sched_attr().fair;
-        let weight = fair_attr.weight.load(Relaxed);
-        
-
         match flags {
             Some(EnqueueFlags::Spawn) => {
-                fair_attr.update_request_timeslice(self.time_slice(weight));
-                self.total_weight += weight;
-
-                let (ve, mut vd) = self.request(fair_attr, flags);
-
-                loop {
-                    let res = self.tree.insert(ve, vd, entity.clone());
-                    if res {
-                        break;
-                    }
-                    println!("try1");
-                    vd += 1;
+                // myself
+                let mut total_weight = self.total_weight;
+                let mut total_vrumtime = self.total_vruntime;
+                if let Some(task) = self.current.as_ref() {
+                    let fair_attr = &task.as_thread().unwrap().sched_attr().fair;
+                    let weight = fair_attr.weight.load(Relaxed);
+                    let vruntime = fair_attr.vruntime.load(Relaxed);
+                    total_weight += weight;
+                    total_vrumtime += vruntime * weight;
                 }
+                let weight = fair_attr.weight.load(Relaxed);
+                let vruntime = match total_weight {
+                    0 => fair_attr.vruntime.load(Relaxed),
+                    _ => total_vrumtime / total_weight,
+                };
+                fair_attr.update_request_timeslice(self.time_slice(weight));
+                fair_attr.vruntime.store(vruntime, Relaxed);
+                fair_attr.start_time.store(vruntime, Relaxed);
+                fair_attr.total_ex_time.store(0, Relaxed);
+
+                //queue
+                self.total_weight += weight;
+                self.total_vruntime += vruntime * weight;
+                
+                let (ve, mut vd) = self.request(fair_attr, flags);
+                self.tree.insert(ve, vd, entity.clone());
+
             }
             //睡醒了
             Some(EnqueueFlags::Wake) => {
-                self.total_weight += weight;
-                let lag = fair_attr.lag.load(Relaxed);
-
-                if self.is_empty() || lag >= 0 {
-                    let (ve, mut vd) = self.request(fair_attr, Some(EnqueueFlags::Spawn));
-
-                    loop {
-                        let res = self.tree.insert(ve, vd, entity.clone());
-                        if res {
-                            break;
-                        }
-                        println!("try2");
-                        vd += 1;
-                    }
-                } else {
-                    // 伪装过去申请时间片
-                    fair_attr.eligible_vruntime.store(self.vruntime, Relaxed);
-                    fair_attr.vruntime_deadline.store(
-                        self.vruntime + fair_attr.timeslice.load(Relaxed) / weight, 
-                        Relaxed);
-                    fair_attr.start_time.store(self.vruntime , Relaxed);
-                    fair_attr.excuting_time.store((-lag)as u64 , Relaxed);
-                    fair_attr.total_ex_time.store((-lag)as u64, Relaxed);
-
-                    //误差来源
-                    self.vruntime = (self.vruntime as i64 - (lag / (self.total_weight) as i64) as i64) as u64;
-                    
-                    let (ve, mut vd) = (fair_attr.eligible_vruntime.load(Relaxed), fair_attr.vruntime_deadline.load(Relaxed));
-
-                    loop {
-                        let res = self.tree.insert(ve, vd, entity.clone());
-                        if res {
-                            break;
-                        }
-                        println!("try3");
-                        vd += 1;
-                    }
+                // myself
+                let mut total_weight = self.total_weight;
+                let mut total_vrumtime = self.total_vruntime;
+                if let Some(task) = self.current.as_ref() {
+                    let fair_attr = &task.as_thread().unwrap().sched_attr().fair;
+                    let weight = fair_attr.weight.load(Relaxed);
+                    total_weight += weight;
+                    total_vrumtime += fair_attr.vruntime.load(Relaxed) * weight;
                 }
+                let weight = fair_attr.weight.load(Relaxed);
+                let mut vruntime = match total_weight {
+                    0 => fair_attr.vruntime.load(Relaxed),
+                    _ => total_vrumtime / total_weight,
+                };
+                // special for wake
+                let lag = fair_attr.lag.load(Relaxed);
+                vruntime = (vruntime as i64 - lag / ((total_weight + weight) as i64)) as u64;
+
+                //myslef
+                fair_attr.update_request_timeslice(self.time_slice(weight));
+                fair_attr.vruntime.store(vruntime, Relaxed);
+                fair_attr.start_time.store(vruntime, Relaxed);
+                fair_attr.total_ex_time.store(0, Relaxed);
+                //queue
+                self.total_weight += weight;
+                self.total_vruntime += vruntime * weight;
+                
+                let (ve, mut vd) = self.request(fair_attr, flags);
+                self.tree.insert(ve, vd, entity.clone());
+
             }
             // 时间片未用完被抢占/不配得放回队列,也就是3.4
             None => {
+                let weight = fair_attr.weight.load(Relaxed);
+                let vruntime = fair_attr.vruntime.load(Relaxed);
+                self.total_weight += weight;
+                self.total_vruntime += vruntime * weight;
+
                 let ve = fair_attr.eligible_vruntime.load(Relaxed);
-                let mut vd = fair_attr.vruntime_deadline.load(Relaxed);
-                
-                loop {
-                    let res = self.tree.insert(ve, vd, entity.clone());
-                    if res {
-                        break;
-                    }
-                    println!("try4");
-                    vd += 1;
-                }
+                let vd = fair_attr.vruntime_deadline.load(Relaxed);
+                self.tree.insert(ve, vd, entity.clone());
             }
         }
     }
@@ -311,25 +305,20 @@ impl SchedClassRq for FairClassRq {
     //注意is_wake和dequeue必须是wake()异步的临界区。
     fn dequeue(&mut self, task: Arc<Task>, mut rt: CurrentRuntime) -> bool {
         let fair_attr = &task.as_thread().unwrap().sched_attr().fair;
-    
-        let start: i64 = fair_attr.start_time.load(SeqCst) as i64;
-        let end: i64 = self.vruntime as i64;
-        let weight = fair_attr.weight.load(SeqCst) as i64;
-        let total_ex_time: i64 = fair_attr.total_ex_time.load(SeqCst) as i64;
+        let weight = fair_attr.weight.load(Relaxed);
+        let vruntime = fair_attr.vruntime.load(Relaxed);
+        let total_weight = self.total_weight + weight;
+        let total_vruntime = self.total_vruntime + vruntime * weight;
+
+        let weight = weight as i64;
+        let start: i64 = fair_attr.start_time.load(Relaxed) as i64;
+        let end: i64 = total_vruntime as i64 / total_weight as i64;
+        let total_ex_time: i64 = fair_attr.total_ex_time.load(Relaxed) as i64;
         let lag = (end - start) * weight - total_ex_time;
-        
-        fair_attr.lag.store(lag, SeqCst);
-        self.total_weight -= fair_attr.weight.load(SeqCst);
+        fair_attr.lag.store(lag, Relaxed);
 
-        if self.total_weight == 0 {
-            return true;
-        } else {
-            //误差来源
-            self.vruntime = (self.vruntime as i64 + ((lag + (self.total_weight*73/100)as i64)/ self.total_weight as i64) as i64) as u64;
-
-            return true
-        }
-
+        self.current = None;
+        true
     }
 
     fn len(&self) -> usize {
@@ -341,15 +330,32 @@ impl SchedClassRq for FairClassRq {
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
-        let node = self.tree.pick(self.vruntime)?;
+        if self.is_empty() {
+            return None;
+        }
+
+        let mut total_weight = self.total_weight;
+        let mut total_vrumtime = self.total_vruntime;
+        if let Some(task) = self.current.as_ref() {
+            let fair_attr = &task.as_thread().unwrap().sched_attr().fair;
+            let weight = fair_attr.weight.load(Relaxed);
+            total_weight += weight;
+            total_vrumtime += fair_attr.vruntime.load(Relaxed) * weight;
+        }
+        let sys_vrumtime = (total_vrumtime + total_weight - 1) / total_weight;
+
+        let node = self.tree.pick(sys_vrumtime)?;
         self.tree.delete(node.clone(), None);
 
-        // if node.borrow().eligible_vruntime > self.vruntime{
-            
-        //     // println!("wrong! {}, {}", ve - self.vruntime, self.len());
-        // }
-        let x = Some(node.lock().task.clone());
-        x
+        let task = node.lock().task.clone();
+        let fair_attr = &task.as_thread().unwrap().sched_attr().fair;
+        let weight = fair_attr.weight.load(Relaxed);
+        let vruntime = fair_attr.vruntime.load(Relaxed);
+        self.total_weight -= weight;
+        self.total_vruntime -= weight * vruntime;
+
+        self.current = Some(task.clone());
+        Some(task)
     }
 
     fn update_current(
@@ -358,40 +364,40 @@ impl SchedClassRq for FairClassRq {
         attr: &SchedAttr,
         flags: UpdateFlags,
     ) -> bool {
-        let weight = attr.fair.weight.load(SeqCst);
-        let vruntime_delta = rt.delta / self.total_weight;
-        let realtime_delta = vruntime_delta * self.total_weight;
-        self.vruntime += vruntime_delta;
-        attr.fair.excuting_time.fetch_add(realtime_delta, SeqCst);
-        attr.fair.total_ex_time.fetch_add(realtime_delta, SeqCst);
-        // println!("{}, {}, {}", rt.delta, rt.delta / self.total_weight, self.total_weight);
-        if attr.fair.excuting_time.load(SeqCst) >= attr.fair.timeslice.load(Relaxed) {
-            self.request(&attr.fair, None);
-        }
-        // println!("{},{}", self.vruntime, attr.fair.eligible_vruntime.load(Relaxed));
-        // self.update_ves(&attr.fair);
-        match flags {
-            UpdateFlags::Yield => {
-                true
-            },
-            UpdateFlags::Tick => {
+        //base information
+        let fair_attr = &attr.fair;
+        let weight = fair_attr.weight.load(Relaxed);
+        let total_weight = self.total_weight + weight;
+        //calculate time
+        let vruntime_delta = rt.delta / total_weight;
+        let realtime_delta = vruntime_delta * total_weight;
+        //update
+        fair_attr.vruntime.fetch_add(vruntime_delta, Relaxed);
+        fair_attr.excuting_time.fetch_add(realtime_delta, Relaxed);
+        fair_attr.total_ex_time.fetch_add(realtime_delta, Relaxed);
 
-                // if attr.fair.excuting_time.load(Relaxed) < base_slice_clocks() {
-                //     return false;
-                // }
-                //尝试从vds中拿一个出来，如果vd更小则抢占
-                if let Some(node) = self.tree.pick(self.vruntime) {
-                    if node.lock().vruntime_deadline < attr.fair.vruntime_deadline.load(Relaxed) 
-                    || true {
-                        return true;
-                    }
+        match flags {
+            UpdateFlags::Tick => {
+                if fair_attr.excuting_time.load(Relaxed) < base_slice_clocks() {
+                    return false;
                 }
-                if attr.fair.eligible_vruntime.load(Relaxed) > self.vruntime {
-                    return true;
+
+                // let vruntime = fair_attr.vruntime.load(Relaxed);
+                // let sys_vrumtime = (self.total_vruntime + vruntime * weight + total_weight - 1) / total_weight;
+                // if let Some(node) = self.tree.pick(sys_vrumtime) {
+                //     if node.lock().vruntime_deadline < fair_attr.vruntime_deadline.load(Relaxed) {
+                //         return true;
+                //     }
+                // }
+                if fair_attr.excuting_time.load(Relaxed) >= fair_attr.timeslice.load(Relaxed) {
+                    self.request(&fair_attr, None);
+                    return true
                 }
                 false
             }
-            //睡眠前走这里
+            UpdateFlags::Yield => {
+                true
+            }
             UpdateFlags::Wait => {
                 true
             }
