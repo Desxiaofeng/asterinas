@@ -383,11 +383,11 @@ impl SchedClassRq for FairClassRq {
 
                 let vruntime = fair_attr.vruntime.load(Relaxed);
                 let total_vruntime = self.total_vruntime + vruntime * weight;
-                if let Some(node) = self.tree.pick(total_weight, total_vruntime) {
-                    if node.lock().vruntime_deadline < fair_attr.vruntime_deadline.load(Relaxed) {
-                        return true;
-                    }
-                }
+                // if let Some(node) = self.tree.pick(total_weight, total_vruntime) {
+                //     if node.lock().vruntime_deadline < fair_attr.vruntime_deadline.load(Relaxed) {
+                //         return true;
+                //     }
+                // }
                 if fair_attr.excuting_time.load(Relaxed) >= fair_attr.timeslice.load(Relaxed) {
                     self.request(&fair_attr, None);
                     if !vruntime_less(fair_attr.eligible_vruntime.load(Relaxed), total_weight, total_vruntime) {
