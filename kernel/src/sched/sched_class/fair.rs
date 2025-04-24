@@ -342,9 +342,8 @@ impl SchedClassRq for FairClassRq {
             total_weight += weight;
             total_vrumtime += fair_attr.vruntime.load(Relaxed) * weight;
         }
-        let sys_vrumtime = (total_vrumtime + total_weight - 1) / total_weight;
 
-        let node = self.tree.pick(sys_vrumtime)?;
+        let node = self.tree.pick(total_weight, total_vrumtime)?;
         self.tree.delete(node.clone(), None);
 
         let task = node.lock().task.clone();
@@ -383,15 +382,15 @@ impl SchedClassRq for FairClassRq {
                 }
 
                 let vruntime = fair_attr.vruntime.load(Relaxed);
-                let sys_vrumtime = (self.total_vruntime + vruntime * weight + total_weight - 1) / total_weight;
-                if let Some(node) = self.tree.pick(sys_vrumtime) {
+                let total_vruntime = self.total_vruntime + vruntime * weight;
+                if let Some(node) = self.tree.pick(total_weight, total_vruntime) {
                     if node.lock().vruntime_deadline < fair_attr.vruntime_deadline.load(Relaxed) {
                         return true;
                     }
                 }
                 if fair_attr.excuting_time.load(Relaxed) >= fair_attr.timeslice.load(Relaxed) {
                     self.request(&fair_attr, None);
-                    if fair_attr.eligible_vruntime.load(Relaxed) > sys_vrumtime {
+                    if !vruntime_less(fair_attr.eligible_vruntime.load(Relaxed), total_weight, total_vruntime) {
                         return true
                     }
                 }
@@ -405,4 +404,9 @@ impl SchedClassRq for FairClassRq {
             }
         }
     }
+}
+
+#[inline(always)]
+pub fn vruntime_less(ev: u64, total_weight: u64, total_vruntime: u64) -> bool {
+    return (ev * total_weight) as i64 - total_vruntime as i64 <= 0;
 }

@@ -7,6 +7,7 @@ use ostd::{
         Task,
     },
 };
+use super::fair::vruntime_less;
 use spin::Mutex;
 #[derive(Debug)]
 pub struct AugmentTree {
@@ -110,7 +111,7 @@ impl AugmentTree {
         return true;
     }
 
-    pub fn pick(&self, ev: u64) -> Option<Arc<Mutex<AugmentTreeNode>>> {
+    pub fn pick(&self, total_weight: u64, total_vruntime: u64) -> Option<Arc<Mutex<AugmentTreeNode>>> {
         if self.len == 0 {
             return None;
         }
@@ -120,7 +121,7 @@ impl AugmentTree {
         loop {
             let guard = current.lock();
             if let Some(node) = guard.left_child.as_ref() {
-                if node.lock().min_eligible_vruntime <= ev{
+                if vruntime_less(node.lock().min_eligible_vruntime, total_weight, total_vruntime){
                     let next = node.clone();
                     drop(guard);
                     current = next;
@@ -129,7 +130,7 @@ impl AugmentTree {
             }
 
             // current or right
-            if guard.eligible_vruntime <= ev {
+            if vruntime_less(guard.eligible_vruntime, total_weight, total_vruntime) {
                 drop(guard);
                 return Some(current);
             } else {
