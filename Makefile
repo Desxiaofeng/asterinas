@@ -48,7 +48,7 @@ VHOST ?= off
 CARGO_OSDK := ~/.cargo/bin/cargo-osdk
 
 CARGO_OSDK_ARGS := --target-arch=$(ARCH) --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
-
+#CARGO_OSDK_ARGS += --qemu-args="-smp cpus=4,sockets=1"
 ifeq ($(AUTO_TEST), syscall)
 BUILD_SYSCALL_TEST := 1
 CARGO_OSDK_ARGS += --kcmd-args="SYSCALL_TEST_DIR=$(SYSCALL_TEST_DIR)"

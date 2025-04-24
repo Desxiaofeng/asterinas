@@ -270,7 +270,11 @@ impl SchedClassRq for FairClassRq {
                 };
                 // special for wake
                 let lag = fair_attr.lag.load(Relaxed);
-                vruntime = (vruntime as i64 - lag / ((total_weight + weight) as i64)) as u64;
+                // only lag < 0, do nothing when lag >= 0
+                if lag < 0 {
+                    vruntime = (vruntime as i64 - lag / ((total_weight + weight) as i64)) as u64;
+                }
+                
 
                 //myslef
                 fair_attr.update_request_timeslice(self.time_slice(weight));
@@ -366,10 +370,9 @@ impl SchedClassRq for FairClassRq {
         //base information
         let fair_attr = &attr.fair;
         let weight = fair_attr.weight.load(Relaxed);
-        let total_weight = self.total_weight + weight;
         //calculate time
-        let vruntime_delta = rt.delta / total_weight;
-        let realtime_delta = vruntime_delta * total_weight;
+        let vruntime_delta = rt.delta / weight;
+        let realtime_delta = vruntime_delta * weight;
         //update
         fair_attr.vruntime.fetch_add(vruntime_delta, Relaxed);
         fair_attr.excuting_time.fetch_add(realtime_delta, Relaxed);
@@ -377,19 +380,32 @@ impl SchedClassRq for FairClassRq {
 
         match flags {
             UpdateFlags::Tick => {
+                // {
+                //     let total_weight = self.total_weight + weight;
+                //     let vruntime = fair_attr.vruntime.load(Relaxed);
+                //     let total_vruntime = self.total_vruntime + vruntime * weight;
+            
+                //     let weight = weight as i64;
+                //     let start: i64 = fair_attr.start_time.load(Relaxed) as i64;
+                //     let end: i64 = total_vruntime as i64 / total_weight as i64;
+                //     let total_ex_time: i64 = fair_attr.total_ex_time.load(Relaxed) as i64;
+                //     let lag = (end - start) * weight - total_ex_time;
+                //     print!("{},", lag);
+                // }
                 if fair_attr.excuting_time.load(Relaxed) < base_slice_clocks() {
                     return false;
                 }
-
+                let total_weight = self.total_weight + weight;
                 let vruntime = fair_attr.vruntime.load(Relaxed);
                 let total_vruntime = self.total_vruntime + vruntime * weight;
-                // if let Some(node) = self.tree.pick(total_weight, total_vruntime) {
-                //     if node.lock().vruntime_deadline < fair_attr.vruntime_deadline.load(Relaxed) {
-                //         return true;
-                //     }
-                // }
+
                 if fair_attr.excuting_time.load(Relaxed) >= fair_attr.timeslice.load(Relaxed) {
                     self.request(&fair_attr, None);
+                    if let Some(node) = self.tree.pick(total_weight, total_vruntime) {
+                        if node.lock().vruntime_deadline < fair_attr.vruntime_deadline.load(Relaxed) {
+                            return true;
+                        }
+                    }
                     if !vruntime_less(fair_attr.eligible_vruntime.load(Relaxed), total_weight, total_vruntime) {
                         return true
                     }
