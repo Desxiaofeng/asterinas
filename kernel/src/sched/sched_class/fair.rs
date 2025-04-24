@@ -382,16 +382,18 @@ impl SchedClassRq for FairClassRq {
                     return false;
                 }
 
-                // let vruntime = fair_attr.vruntime.load(Relaxed);
-                // let sys_vrumtime = (self.total_vruntime + vruntime * weight + total_weight - 1) / total_weight;
-                // if let Some(node) = self.tree.pick(sys_vrumtime) {
-                //     if node.lock().vruntime_deadline < fair_attr.vruntime_deadline.load(Relaxed) {
-                //         return true;
-                //     }
-                // }
+                let vruntime = fair_attr.vruntime.load(Relaxed);
+                let sys_vrumtime = (self.total_vruntime + vruntime * weight + total_weight - 1) / total_weight;
+                if let Some(node) = self.tree.pick(sys_vrumtime) {
+                    if node.lock().vruntime_deadline < fair_attr.vruntime_deadline.load(Relaxed) {
+                        return true;
+                    }
+                }
                 if fair_attr.excuting_time.load(Relaxed) >= fair_attr.timeslice.load(Relaxed) {
                     self.request(&fair_attr, None);
-                    return true
+                    if fair_attr.eligible_vruntime.load(Relaxed) > sys_vrumtime {
+                        return true
+                    }
                 }
                 false
             }
